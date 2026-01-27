@@ -44,6 +44,7 @@ export interface GameState {
   revealInProgress: boolean;
   currentRevealIndex: number;
   broadcastTitle: string;
+  selectedTier?: string;
 }
 
 export interface Session {

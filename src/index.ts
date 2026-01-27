@@ -184,7 +184,7 @@ app.patch('/api/sessions/:id/settings', (req, res) => {
     return res.status(404).json({ error: 'Session not found' });
   }
 
-  const { currentWeek, broadcastTitle, guestEnabled } = req.body;
+  const { currentWeek, broadcastTitle, guestEnabled, selectedTier } = req.body;
   const state = session.state;
 
   if (currentWeek !== undefined) {
@@ -204,6 +204,9 @@ app.patch('/api/sessions/:id/settings', (req, res) => {
     } else {
       state.guestEnabled = guestEnabled;
     }
+  }
+  if (selectedTier !== undefined) {
+    state.selectedTier = selectedTier || undefined;
   }
 
   updateSession(req.params.id, state);
