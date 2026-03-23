@@ -1,7 +1,7 @@
 import express, { Response } from 'express';
 import cors from 'cors';
 import { v4 as uuidv4 } from 'uuid';
-import type { GameState, Participant } from './types';
+import type { GameState, Participant, PlayoffMatchup, PlayoffPrediction, PlayoffBracket } from './types';
 import { createSession, getSession, getAllSessions, updateSession, deleteSession } from './db';
 
 const app = express();
@@ -65,6 +65,8 @@ const initialGameState: GameState = {
   revealInProgress: false,
   currentRevealIndex: -1,
   broadcastTitle: 'CSC PREDICTION CHALLENGE',
+  playoffMode: false,
+  playoffPredictions: [],
 };
 
 // SSE endpoint for real-time updates
@@ -413,6 +415,278 @@ app.post('/api/sessions/:id/clear-predictions', (req, res) => {
   session.state.participants.forEach(p => {
     p.predictions = [];
     p.ownTeamPrediction = undefined;
+  });
+
+  updateSession(req.params.id, session.state);
+  broadcastStateUpdate(req.params.id);
+  res.json(session.state);
+});
+
+// ==================== PLAYOFF MODE ENDPOINTS ====================
+
+// Toggle playoff mode
+app.patch('/api/sessions/:id/playoff-mode', (req, res) => {
+  const session = getSession(req.params.id);
+  if (!session) {
+    return res.status(404).json({ error: 'Session not found' });
+  }
+
+  const { enabled } = req.body;
+  if (typeof enabled !== 'boolean') {
+    return res.status(400).json({ error: 'enabled must be a boolean' });
+  }
+
+  session.state.playoffMode = enabled;
+  if (enabled && !session.state.playoffPredictions) {
+    session.state.playoffPredictions = [];
+  }
+
+  updateSession(req.params.id, session.state);
+  broadcastStateUpdate(req.params.id);
+  res.json({ playoffMode: session.state.playoffMode });
+});
+
+// Set/update the playoff bracket (matchups)
+app.put('/api/sessions/:id/playoff-bracket', (req, res) => {
+  const session = getSession(req.params.id);
+  if (!session) {
+    return res.status(404).json({ error: 'Session not found' });
+  }
+
+  const { tier, matchups } = req.body as { tier: string; matchups: PlayoffMatchup[] };
+  if (!tier || !Array.isArray(matchups)) {
+    return res.status(400).json({ error: 'tier and matchups array required' });
+  }
+
+  // Ensure each matchup has an id
+  const bracketMatchups = matchups.map(m => ({
+    ...m,
+    id: m.id || uuidv4(),
+  }));
+
+  session.state.playoffBracket = { tier, matchups: bracketMatchups };
+  session.state.playoffMode = true;
+
+  updateSession(req.params.id, session.state);
+  broadcastStateUpdate(req.params.id);
+  res.json(session.state.playoffBracket);
+});
+
+// Get the playoff bracket
+app.get('/api/sessions/:id/playoff-bracket', (req, res) => {
+  const session = getSession(req.params.id);
+  if (!session) {
+    return res.status(404).json({ error: 'Session not found' });
+  }
+
+  res.json(session.state.playoffBracket || null);
+});
+
+// Update a single matchup (set winner/score)
+app.patch('/api/sessions/:id/playoff-bracket/matchups/:matchupId', (req, res) => {
+  const session = getSession(req.params.id);
+  if (!session) {
+    return res.status(404).json({ error: 'Session not found' });
+  }
+
+  if (!session.state.playoffBracket) {
+    return res.status(404).json({ error: 'No playoff bracket set' });
+  }
+
+  const matchup = session.state.playoffBracket.matchups.find(m => m.id === req.params.matchupId);
+  if (!matchup) {
+    return res.status(404).json({ error: 'Matchup not found' });
+  }
+
+  const { team1, team2, winner, score, scheduledDate } = req.body;
+  if (team1 !== undefined) matchup.team1 = team1;
+  if (team2 !== undefined) matchup.team2 = team2;
+  // Allow clearing winner by passing undefined/null/empty string
+  if ('winner' in req.body) matchup.winner = winner || undefined;
+  if ('score' in req.body) matchup.score = score || undefined;
+  if (scheduledDate !== undefined) matchup.scheduledDate = scheduledDate;
+
+  // Update prediction correctness when result is set or cleared
+  if (session.state.playoffPredictions) {
+    session.state.playoffPredictions.forEach(pred => {
+      if (pred.matchupId === req.params.matchupId) {
+        if (matchup.winner && matchup.score) {
+          pred.correct = pred.predictedWinner === matchup.winner;
+          pred.scoreCorrect = pred.correct && pred.predictedScore === matchup.score;
+        } else {
+          // Clear correctness if result is cleared
+          pred.correct = undefined;
+          pred.scoreCorrect = undefined;
+        }
+      }
+    });
+    
+    // Also update participant playoff scores
+    session.state.participants.forEach(participant => {
+      const participantPreds = session.state.playoffPredictions.filter(p => p.participantId === participant.id);
+      const correctCount = participantPreds.filter(p => p.correct === true).length;
+      const scoreBonusCount = participantPreds.filter(p => p.scoreCorrect === true).length;
+      participant.playoffScore = correctCount + scoreBonusCount;
+    });
+  }
+
+  updateSession(req.params.id, session.state);
+  broadcastStateUpdate(req.params.id);
+  res.json(matchup);
+});
+
+// Get all playoff predictions
+app.get('/api/sessions/:id/playoff-predictions', (req, res) => {
+  const session = getSession(req.params.id);
+  if (!session) {
+    return res.status(404).json({ error: 'Session not found' });
+  }
+
+  res.json(session.state.playoffPredictions || []);
+});
+
+// Get playoff predictions for a specific participant
+app.get('/api/sessions/:id/participants/:participantId/playoff-predictions', (req, res) => {
+  const session = getSession(req.params.id);
+  if (!session) {
+    return res.status(404).json({ error: 'Session not found' });
+  }
+
+  const predictions = (session.state.playoffPredictions || []).filter(
+    p => p.participantId === req.params.participantId
+  );
+  res.json(predictions);
+});
+
+// Add/update a playoff prediction for a participant
+app.put('/api/sessions/:id/participants/:participantId/playoff-predictions/:matchupId', (req, res) => {
+  const session = getSession(req.params.id);
+  if (!session) {
+    return res.status(404).json({ error: 'Session not found' });
+  }
+
+  const participant = session.state.participants.find(p => p.id === req.params.participantId);
+  if (!participant) {
+    return res.status(404).json({ error: 'Participant not found' });
+  }
+
+  if (!session.state.playoffBracket) {
+    return res.status(400).json({ error: 'No playoff bracket set' });
+  }
+
+  const matchup = session.state.playoffBracket.matchups.find(m => m.id === req.params.matchupId);
+  if (!matchup) {
+    return res.status(404).json({ error: 'Matchup not found' });
+  }
+
+  const { predictedWinner, predictedScore } = req.body;
+  if (!predictedWinner || !predictedScore) {
+    return res.status(400).json({ error: 'predictedWinner and predictedScore required' });
+  }
+
+  if (predictedScore !== '2-0' && predictedScore !== '2-1') {
+    return res.status(400).json({ error: 'predictedScore must be "2-0" or "2-1"' });
+  }
+
+  // Initialize predictions array if needed
+  if (!session.state.playoffPredictions) {
+    session.state.playoffPredictions = [];
+  }
+
+  // Find existing prediction or create new one
+  const existingIndex = session.state.playoffPredictions.findIndex(
+    p => p.matchupId === req.params.matchupId && p.participantId === req.params.participantId
+  );
+
+  const prediction: PlayoffPrediction = {
+    matchupId: req.params.matchupId,
+    participantId: req.params.participantId,
+    predictedWinner,
+    predictedScore,
+    revealed: false,
+  };
+
+  // Check correctness if result already set
+  if (matchup.winner && matchup.score) {
+    prediction.correct = prediction.predictedWinner === matchup.winner;
+    prediction.scoreCorrect = prediction.correct && prediction.predictedScore === matchup.score;
+  }
+
+  if (existingIndex >= 0) {
+    session.state.playoffPredictions[existingIndex] = {
+      ...session.state.playoffPredictions[existingIndex],
+      ...prediction,
+    };
+  } else {
+    session.state.playoffPredictions.push(prediction);
+  }
+
+  updateSession(req.params.id, session.state);
+  broadcastStateUpdate(req.params.id);
+  res.json(prediction);
+});
+
+// Delete a playoff prediction
+app.delete('/api/sessions/:id/participants/:participantId/playoff-predictions/:matchupId', (req, res) => {
+  const session = getSession(req.params.id);
+  if (!session) {
+    return res.status(404).json({ error: 'Session not found' });
+  }
+
+  if (!session.state.playoffPredictions) {
+    return res.status(404).json({ error: 'Prediction not found' });
+  }
+
+  const index = session.state.playoffPredictions.findIndex(
+    p => p.matchupId === req.params.matchupId && p.participantId === req.params.participantId
+  );
+
+  if (index === -1) {
+    return res.status(404).json({ error: 'Prediction not found' });
+  }
+
+  session.state.playoffPredictions.splice(index, 1);
+  updateSession(req.params.id, session.state);
+  broadcastStateUpdate(req.params.id);
+  res.status(204).send();
+});
+
+// Reveal/hide playoff predictions for a matchup
+app.patch('/api/sessions/:id/playoff-predictions/matchup/:matchupId/reveal', (req, res) => {
+  const session = getSession(req.params.id);
+  if (!session) {
+    return res.status(404).json({ error: 'Session not found' });
+  }
+
+  const { revealed } = req.body;
+  if (typeof revealed !== 'boolean') {
+    return res.status(400).json({ error: 'revealed must be a boolean' });
+  }
+
+  const matchupPredictions = (session.state.playoffPredictions || []).filter(
+    p => p.matchupId === req.params.matchupId
+  );
+
+  matchupPredictions.forEach(pred => {
+    pred.revealed = revealed;
+  });
+
+  updateSession(req.params.id, session.state);
+  broadcastStateUpdate(req.params.id);
+  res.json(matchupPredictions);
+});
+
+// Clear all playoff data
+app.post('/api/sessions/:id/clear-playoff', (req, res) => {
+  const session = getSession(req.params.id);
+  if (!session) {
+    return res.status(404).json({ error: 'Session not found' });
+  }
+
+  session.state.playoffBracket = undefined;
+  session.state.playoffPredictions = [];
+  session.state.participants.forEach(p => {
+    p.playoffScore = 0;
   });
 
   updateSession(req.params.id, session.state);
